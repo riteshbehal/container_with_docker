@@ -1,0 +1,204 @@
+Docker to Amazon EKS | Command Cheat Sheet
+DRAFT v2 | Copy/paste commands + verification after each major step | AWS CloudShell uses Bash; Docker build/push on local machine.
+
+Demo target: eks-cluster, us-east-1, AWS account 463646775279. If using the earlier ekscluster in eu-west-2, change ALL
+cluster/region/image values consistently. ECR repository names are case- and hyphen-sensitive.
+
+============================================================
+01 | Build PHP Docker Image - LOCAL
+============================================================
+docker build -t phpapp:v3 .
+docker images phpapp
+docker image inspect phpapp:v3 --format "{{.Id}}"
+
+Run in the PHP project directory containing its Dockerfile.
+
+============================================================
+02 | Build MySQL Docker Image - LOCAL
+============================================================
+docker build -t mysql-exam-image .
+docker images mysql-exam-image
+docker image inspect mysql-exam-image:latest --format "{{.Id}}"
+
+Run in the MySQL project directory containing Dockerfile and 01.sql.
+
+============================================================
+03 | Optional local container verification - LOCAL
+============================================================
+docker ps -a
+docker logs mysql-instance --tail 50
+docker logs php-instance --tail 50
+docker inspect mysql-instance --format "{{.State.Status}}"
+docker network inspect bridge
+
+Use only if local containers exist. Image inspection and container inspection are different.
+
+============================================================
+04 | ECR Login, Tag, and Push - LOCAL
+============================================================
+aws ecr get-login-password --region us-east-1 |  docker login --username AWS --password-stdin  463646775279.dkr.ecr.us-east-1.amazonaws.com
+
+docker tag phpapp:v3  463646775279.dkr.ecr.us-east-1.amazonaws.com/phpapp:latest
+docker push 463646775279.dkr.ecr.us-east-1.amazonaws.com/phpapp:latest
+
+docker tag mysql-exam-image:latest  463646775279.dkr.ecr.us-east-1.amazonaws.com/mysql-exam-image:latest
+docker push 463646775279.dkr.ecr.us-east-1.amazonaws.com/mysql-exam-image:latest
+
+Create ECR repositories in AWS Console first if absent. Correct MySQL repo: mysql-exam-image (with both hyphens).
+
+============================================================
+05 | Verify ECR Push - CloudShell
+============================================================
+aws ecr describe-images --repository-name phpapp  --region us-east-1 --query "imageDetails[*].imageTags"
+aws ecr describe-images --repository-name mysql-exam-image  --region us-east-1 --query "imageDetails[*].imageTags"
+
+============================================================
+06 | Create EKS Cluster + Managed Node Group - AWS UI
+============================================================
+AWS Console > EKS: create Standard cluster (Auto Mode off), then Managed Node Group. Verify nodes are Ready and schedulable. No
+need to SSH into control plane.
+
+============================================================
+07 | Install kubectl / Configure EKS Access - CloudShell
+============================================================
+curl -LO "https://dl.k8s.io/release/$(curl -L -s  https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+kubectl version --client
+
+aws eks update-kubeconfig --region us-east-1 --name eks-cluster
+kubectl config current-context
+kubectl get nodes -o wide
+
+kubectl should be within one minor version of the EKS control plane. Earlier saved example: aws eks update-kubeconfig --region
+eu-west-2 --name ekscluster (only for that separate cluster).
+
+============================================================
+08 | Download and Create Controller IAM Policy - CloudShell
+============================================================
+POLICY_BASE="https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller"
+POLICY_URL="$POLICY_BASE/v2.14.1/docs/install/iam_policy.json"
+
+curl -O "$POLICY_URL"
+
+aws iam create-policy  --policy-name AWSLoadBalancerControllerIAMPolicy  --policy-document file://iam_policy.json
+
+If EntityAlreadyExists occurs, verify the existing IAM policy rather than recreating it.
+
+============================================================
+09 | Install eksctl - CloudShell Linux amd64
+============================================================
+ARCH=amd64
+PLATFORM=$(uname -s)_$ARCH
+curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
+tar -xzf "eksctl_$PLATFORM.tar.gz" -C /tmp
+sudo install -m 0755 /tmp/eksctl /usr/local/bin/eksctl
+eksctl version
+
+============================================================
+10 | Associate IAM OIDC Provider - CloudShell
+============================================================
+eksctl utils associate-iam-oidc-provider  --cluster=eks-cluster --region=us-east-1 --approve
+
+============================================================
+11 | Create IAM ServiceAccount - CloudShell
+============================================================
+eksctl create iamserviceaccount  --cluster=eks-cluster  --region=us-east-1  --namespace=kube-system  --name=aws-load-balancer-controller  --role-name=AmazonEKSLoadBalancerControllerRole  --attach-policy-arn=arn:aws:iam::463646775279:policy/AWSLoadBalancerControllerIAMPolicy  --approve
+
+kubectl get sa aws-load-balancer-controller -n kube-system
+kubectl get sa aws-load-balancer-controller -n kube-system  -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'
+
+If eksctl reports a CloudFormation naming conflict, inspect the stack and IAM role first; do not blindly delete. If an existing Kubernetes SA
+needs updating, --override-existing-serviceaccounts is conditional.
+
+============================================================
+12 | Install Helm - CloudShell
+============================================================
+curl -fsSL -o get_helm.sh  https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+helm version
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update eks
+
+============================================================
+13 | Get VPC ID + Install AWS Load Balancer Controller
+============================================================
+VPC_ID=$(aws eks describe-cluster  --name eks-cluster --region us-east-1  --query "cluster.resourcesVpcConfig.vpcId" --output text)
+echo "$VPC_ID"
+
+helm install aws-load-balancer-controller  eks/aws-load-balancer-controller  -n kube-system --version 1.14.0  --set clusterName=eks-cluster  --set serviceAccount.create=false  --set serviceAccount.name=aws-load-balancer-controller  --set region=us-east-1 --set vpcId="$VPC_ID"
+
+============================================================
+14 | Controller Health Check - BEFORE Services
+============================================================
+kubectl rollout status deployment/aws-load-balancer-controller  -n kube-system --timeout=120s
+kubectl get deployment aws-load-balancer-controller -n kube-system
+kubectl get pods -n kube-system  -l app.kubernetes.io/name=aws-load-balancer-controller
+kubectl get endpoints aws-load-balancer-webhook-service -n kube-system
+
+Expected: Controller 2/2 Ready and webhook has endpoints. If not, diagnose first; otherwise service creation can fail.
+
+============================================================
+15 | Deploy MySQL and PHP - CloudShell
+============================================================
+
+kubectl apply -f mysql-deployment.yml
+kubectl apply -f mysql-service.yml
+kubectl apply -f phpapp-deployment.yml
+kubectl apply -f phpapp-service.yml
+
+MySQL Service: ClusterIP; PHP Service: LoadBalancer with NLB annotations, correct selector, and loadBalancerClass: service.k8s.aws/nlb.
+Apply individual YAML files; do not apply iam_policy.json as a Kubernetes manifest.
+
+============================================================
+16 | Verify All Kubernetes Resources
+============================================================
+kubectl get deployments
+kubectl get pods -o wide
+kubectl get svc
+kubectl get endpoints mysql-service
+kubectl get endpoints phpapp-service
+kubectl rollout status deployment/mysql-deployment
+kubectl rollout status deployment/phpapp-deployment
+
+============================================================
+17 | Troubleshooting: get / describe / logs / exec
+============================================================
+kubectl describe pod -l app=mysql-backend
+kubectl logs deployment/mysql-deployment --tail=100
+kubectl logs deployment/mysql-deployment --previous --tail=100
+kubectl describe svc phpapp-service
+kubectl logs -n kube-system deployment/aws-load-balancer-controller --tail=80
+
+kubectl exec deployment/mysql-deployment --  cat /docker-entrypoint-initdb.d/01.sql
+kubectl get deployment mysql-deployment  -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+If MySQL Pod is ImagePullBackOff, logs/exec may not work; use kubectl describe pod Events to inspect the ECR URI. Label selector in this
+project is app=mysql-backend.
+
+============================================================
+18 | Fix Wrong ECR MySQL Repo Name (if required)
+============================================================
+kubectl set image deployment/mysql-deployment  mysql-instance=463646775279.dkr.ecr.us-east-1.amazonaws.com/mysql-exam-image:latest
+kubectl rollout status deployment/mysql-deployment
+kubectl get pods
+
+Also correct mysql-deployment.yml on disk, or later kubectl apply may revert this change. No image rebuild needed when only
+Deployment URI was wrong.
+
+============================================================
+19 | NLB Endpoint + Browser Test
+============================================================
+kubectl get svc phpapp-service
+kubectl get svc phpapp-service  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+kubectl describe svc phpapp-service
+
+Open http://NLB-DNS/ or http://NLB-DNS/Index.php. Use listener port 80, not local Docker port 8080/8082. Check AWS EC2 > Target
+Groups > health if needed.
+
+============================================================
+20 | Quick Failure Map (reference only)
+============================================================
+ImagePullBackOff: kubectl describe pod; check ECR repo/tag, IAM and connectivity. Service webhook no endpoints: controller health +
+ServiceAccount. Controller FailedCreate: describe ReplicaSet, check missing SA. Controller CrashLoopBackOff: --previous logs, verify
+region/VPC ID. MySQL Connection refused: MySQL Pod, logs, endpoints, then SQL. Access denied: MySQL username/password.
